@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local Codex data and backups should never be committed.
+.codex/
+recovery_backups/
+state_5.sqlite*
+session_index.jsonl
+*.jsonl
