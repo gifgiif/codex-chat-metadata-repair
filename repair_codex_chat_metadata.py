@@ -6,11 +6,14 @@ This script fixes active, non-archived chats whose display metadata was lost
 `thread_source` for active VS Code/Codex Desktop threads and appends current
 names to `session_index.jsonl`.
 
+It can also sanitize unusually large rollout JSONL files by replacing very large
+embedded strings, such as base64 screenshots, with small placeholders. This keeps
+the rollout valid while making it possible for Codex to index/read the thread
+again after a restart.
+
 It intentionally does not unarchive chats and does not move rollout files.
 Close Codex before running it.
 """
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -20,9 +23,23 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
+
+
+DEFAULT_LARGE_ROLLOUT_BYTES = 50 * 1024 * 1024
+DEFAULT_LARGE_STRING_CHARS = 20_000
+
+
+@dataclass(frozen=True)
+class RepairOptions:
+    dry_run: bool
+    large_rollout_bytes: int
+    large_string_chars: int
+    skip_large_rollout_sanitize: bool
+    skip_session_index_refresh: bool
 
 
 def default_codex_home() -> Path:
@@ -142,17 +159,48 @@ def make_title(text: str, fallback: str) -> str:
     return fallback
 
 
-def backup_files(codex_home: Path, backup_dir: Path) -> None:
+@dataclass(frozen=True)
+class KnownMetadata:
+    title: str
+    preview: str
+    first_user_message: str
+    thread_source: str
+
+
+def state_db_paths(codex_home: Path) -> list[Path]:
+    candidates = [
+        codex_home / "state_5.sqlite",
+        codex_home / "sqlite" / "state_5.sqlite",
+    ]
+    paths: list[Path] = []
+    seen = set()
+    for path in candidates:
+        if not path.exists():
+            continue
+        key = str(path.resolve())
+        if key not in seen:
+            paths.append(path)
+            seen.add(key)
+    return paths
+
+
+def backup_files(codex_home: Path, db_paths: list[Path], backup_dir: Path) -> None:
     backup_dir.mkdir(parents=True, exist_ok=False)
-    for name in (
-        "state_5.sqlite",
-        "state_5.sqlite-wal",
-        "state_5.sqlite-shm",
-        "session_index.jsonl",
-    ):
-        source = codex_home / name
+    for db_path in db_paths:
+        relative = db_path.relative_to(codex_home)
+        for source in (
+            db_path,
+            db_path.with_name(f"{db_path.name}-wal"),
+            db_path.with_name(f"{db_path.name}-shm"),
+        ):
+            if source.exists():
+                target = backup_dir / relative.parent / source.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+    for source in (codex_home / "session_index.jsonl",):
         if source.exists():
-            shutil.copy2(source, backup_dir / name)
+            shutil.copy2(source, backup_dir / source.name)
 
 
 def append_session_index(codex_home: Path, thread_id: str, title: str) -> None:
@@ -163,6 +211,13 @@ def append_session_index(codex_home: Path, thread_id: str, title: str) -> None:
     }
     with (codex_home / "session_index.jsonl").open("a", encoding="utf-8") as file:
         file.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def backup_rollout(rollout_path: Path, backup_dir: Path, thread_id: str) -> None:
+    rollout_backup = backup_dir / "rollouts" / f"{thread_id}.jsonl"
+    rollout_backup.parent.mkdir(parents=True, exist_ok=True)
+    if not rollout_backup.exists():
+        shutil.copy2(rollout_path, rollout_backup)
 
 
 def repair_rollout_header(
@@ -194,9 +249,7 @@ def repair_rollout_header(
         return False
 
     if not dry_run:
-        rollout_backup = backup_dir / "rollouts" / f"{thread_id}.jsonl"
-        rollout_backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(rollout_path, rollout_backup)
+        backup_rollout(rollout_path, backup_dir, thread_id)
         payload["thread_source"] = "user"
         lines[0] = (
             json.dumps(first_obj, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -205,16 +258,292 @@ def repair_rollout_header(
     return True
 
 
-def repair(codex_home: Path, dry_run: bool) -> int:
-    db_path = codex_home / "state_5.sqlite"
-    if not db_path.exists():
-        raise FileNotFoundError(f"state database not found: {db_path}")
+@dataclass(frozen=True)
+class ActiveThread:
+    thread_id: str
+    title: str
+    rollout_path: Path
 
-    backup_dir = (
-        codex_home / "recovery_backups" / f"quick_chat_metadata_fix_{utc_stamp()}"
-    )
-    if not dry_run:
-        backup_files(codex_home, backup_dir)
+
+def load_active_threads(db_paths: list[Path]) -> dict[str, ActiveThread]:
+    threads: dict[str, ActiveThread] = {}
+    for db_path in db_paths:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                select id, title, rollout_path
+                from threads
+                where archived = 0
+                  and coalesce(title, '') <> ''
+                  and coalesce(rollout_path, '') <> ''
+                """
+            )
+        except sqlite3.Error:
+            conn.close()
+            continue
+
+        for row in rows:
+            threads[row["id"]] = ActiveThread(
+                thread_id=row["id"],
+                title=row["title"],
+                rollout_path=Path(row["rollout_path"]),
+            )
+        conn.close()
+    return threads
+
+
+def shrink_large_strings(value: object, max_chars: int) -> tuple[object, int]:
+    if isinstance(value, str):
+        if len(value) > max_chars:
+            return (
+                f"[omitted large string by codex-chat-metadata-repair: {len(value)} chars]",
+                1,
+            )
+        return value, 0
+    if isinstance(value, list):
+        changed = 0
+        shrunk_items = []
+        for item in value:
+            shrunk, item_changed = shrink_large_strings(item, max_chars)
+            changed += item_changed
+            shrunk_items.append(shrunk)
+        return shrunk_items, changed
+    if isinstance(value, dict):
+        changed = 0
+        shrunk_dict = {}
+        for key, item in value.items():
+            shrunk, item_changed = shrink_large_strings(item, max_chars)
+            changed += item_changed
+            shrunk_dict[key] = shrunk
+        return shrunk_dict, changed
+    return value, 0
+
+
+def rollout_needs_sanitize(rollout_path: Path, min_bytes: int) -> bool:
+    try:
+        return rollout_path.exists() and rollout_path.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
+
+def sanitize_large_rollout(
+    rollout_path: Path,
+    backup_dir: Path,
+    thread_id: str,
+    max_string_chars: int,
+    dry_run: bool,
+) -> tuple[bool, int, int, int]:
+    changed_records = 0
+    changed_strings = 0
+    original_bytes = 0
+    new_bytes = 0
+
+    try:
+        source = rollout_path.open("rb")
+    except OSError:
+        return False, 0, 0, 0
+
+    with source:
+        if dry_run:
+            for raw in source:
+                original_bytes += len(raw)
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    new_bytes += len(raw)
+                    continue
+                shrunk, line_changed_strings = shrink_large_strings(
+                    obj,
+                    max_string_chars,
+                )
+                if line_changed_strings:
+                    changed_records += 1
+                    changed_strings += line_changed_strings
+                out = json.dumps(
+                    shrunk,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ) + "\n"
+                new_bytes += len(out.encode("utf-8"))
+            return (
+                changed_records > 0,
+                changed_records,
+                changed_strings,
+                original_bytes - new_bytes,
+            )
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{rollout_path.name}.", suffix=".tmp", dir=rollout_path.parent
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            with tmp_path.open("w", encoding="utf-8") as target:
+                for raw in source:
+                    original_bytes += len(raw)
+                    try:
+                        obj = json.loads(raw)
+                    except json.JSONDecodeError:
+                        text = raw.decode("utf-8", errors="replace")
+                        target.write(text)
+                        new_bytes += len(text.encode("utf-8"))
+                        continue
+
+                    shrunk, line_changed_strings = shrink_large_strings(
+                        obj,
+                        max_string_chars,
+                    )
+                    if line_changed_strings:
+                        changed_records += 1
+                        changed_strings += line_changed_strings
+                    out = json.dumps(
+                        shrunk,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ) + "\n"
+                    target.write(out)
+                    new_bytes += len(out.encode("utf-8"))
+
+            if changed_records:
+                with tmp_path.open(encoding="utf-8") as validate:
+                    for line in validate:
+                        json.loads(line)
+                backup_rollout(rollout_path, backup_dir, thread_id)
+                shutil.copystat(rollout_path, tmp_path)
+                tmp_path.replace(rollout_path)
+            else:
+                tmp_path.unlink(missing_ok=True)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    return changed_records > 0, changed_records, changed_strings, original_bytes - new_bytes
+
+
+def sanitize_large_rollouts(
+    active_threads: dict[str, ActiveThread],
+    backup_dir: Path,
+    options: RepairOptions,
+) -> int:
+    if options.skip_large_rollout_sanitize:
+        return 0
+
+    fixed = 0
+    for thread in active_threads.values():
+        if not rollout_needs_sanitize(thread.rollout_path, options.large_rollout_bytes):
+            continue
+        changed, changed_records, changed_strings, saved_bytes = sanitize_large_rollout(
+            thread.rollout_path,
+            backup_dir,
+            thread.thread_id,
+            options.large_string_chars,
+            options.dry_run,
+        )
+        if not changed:
+            continue
+        action = "would sanitize" if options.dry_run else "sanitized"
+        print(
+            f"{action} rollout {thread.thread_id}: "
+            f"records={changed_records} strings={changed_strings} "
+            f"bytes_saved={max(saved_bytes, 0)}"
+        )
+        fixed += 1
+    return fixed
+
+
+def refresh_session_index(
+    codex_home: Path,
+    active_threads: dict[str, ActiveThread],
+    options: RepairOptions,
+) -> int:
+    if options.skip_session_index_refresh:
+        return 0
+
+    index_path = codex_home / "session_index.jsonl"
+    if not index_path.exists():
+        return 0
+
+    try:
+        lines = index_path.read_text(encoding="utf-8", errors="replace").splitlines(
+            keepends=True
+        )
+    except OSError:
+        return 0
+
+    changed = 0
+    refreshed: list[str] = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            refreshed.append(line)
+            continue
+
+        thread = active_threads.get(obj.get("id"))
+        if thread and obj.get("thread_name") != thread.title:
+            obj["thread_name"] = thread.title
+            obj["updated_at"] = now_rfc3339()
+            line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+            changed += 1
+        refreshed.append(line)
+
+    if changed and not options.dry_run:
+        index_path.write_text("".join(refreshed), encoding="utf-8")
+
+    if changed:
+        print(
+            f"{'would refresh' if options.dry_run else 'refreshed'} "
+            f"session_index_entries={changed}"
+        )
+    return changed
+
+
+def load_known_metadata(db_paths: list[Path]) -> dict[str, KnownMetadata]:
+    known: dict[str, KnownMetadata] = {}
+    for db_path in db_paths:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                select id, title, preview, first_user_message, source, thread_source
+                from threads
+                where archived = 0
+                """
+            )
+        except sqlite3.Error:
+            conn.close()
+            continue
+
+        for row in rows:
+            title = row["title"] or ""
+            preview = row["preview"] or ""
+            first_user_message = row["first_user_message"] or ""
+            thread_source = row["thread_source"] or ""
+            if row["source"] == "vscode" and not thread_source:
+                thread_source = "user"
+            if not title or not preview or not first_user_message:
+                continue
+            known[row["id"]] = KnownMetadata(
+                title=title,
+                preview=preview,
+                first_user_message=first_user_message,
+                thread_source=thread_source,
+            )
+        conn.close()
+    return known
+
+
+def repair_one_db(
+    codex_home: Path,
+    db_path: Path,
+    backup_dir: Path,
+    known: dict[str, KnownMetadata],
+    options: RepairOptions,
+) -> tuple[int, int]:
+    print(f"database={db_path}")
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -239,18 +568,34 @@ def repair(codex_home: Path, dry_run: bool) -> int:
     for row in rows:
         rollout_path = Path(row["rollout_path"])
         text = first_user_text(rollout_path, codex_home)
-        title = row["title"] or make_title(text, row["id"])
-        preview = row["preview"] or compact_preview(text or title)
+        fallback = known.get(row["id"])
+        title = (
+            row["title"]
+            or (make_title(fallback.title, row["id"]) if fallback else "")
+            or make_title(text, row["id"])
+        )
+        preview = (
+            row["preview"]
+            or (fallback.preview if fallback else "")
+            or compact_preview(text or title)
+        )
         first_message = row["first_user_message"] or (
-            clean_text(text)[:2000] if text else preview
+            fallback.first_user_message
+            if fallback
+            else clean_text(text)[:2000] if text else preview
         )
-        thread_source = row["thread_source"] or (
-            "user" if row["source"] == "vscode" else row["thread_source"]
+        thread_source = (
+            row["thread_source"]
+            or (fallback.thread_source if fallback else "")
+            or ("user" if row["source"] == "vscode" else row["thread_source"])
         )
 
-        print(f"{'would fix' if dry_run else 'fixing'} {row['id']}: {title}")
+        print(
+            f"{'would fix' if options.dry_run else 'fixing'} "
+            f"{row['id']}: {compact_preview(title, 120)}"
+        )
 
-        if not dry_run:
+        if not options.dry_run:
             conn.execute(
                 """
                 update threads
@@ -265,20 +610,65 @@ def repair(codex_home: Path, dry_run: bool) -> int:
             rollout_path,
             backup_dir,
             row["id"],
-            dry_run,
+            options.dry_run,
         ):
             rollout_headers_fixed += 1
         fixed += 1
 
-    if dry_run:
+    if options.dry_run:
         conn.close()
         print(f"would_fix={fixed}")
-        return fixed
+        return fixed, rollout_headers_fixed
 
     conn.commit()
     conn.close()
     print(f"fixed={fixed}")
     print(f"rollout_headers_fixed={rollout_headers_fixed}")
+    return fixed, rollout_headers_fixed
+
+
+def repair(codex_home: Path, options: RepairOptions) -> int:
+    db_paths = state_db_paths(codex_home)
+    if not db_paths:
+        raise FileNotFoundError(
+            f"state database not found under {codex_home} or {codex_home / 'sqlite'}"
+        )
+
+    backup_dir = (
+        codex_home / "recovery_backups" / f"quick_chat_metadata_fix_{utc_stamp()}"
+    )
+    if not options.dry_run:
+        backup_files(codex_home, db_paths, backup_dir)
+
+    known = load_known_metadata(db_paths)
+    active_threads = load_active_threads(db_paths)
+
+    fixed = 0
+    rollout_headers_fixed = 0
+    for db_path in db_paths:
+        db_fixed, db_rollouts_fixed = repair_one_db(
+            codex_home, db_path, backup_dir, known, options
+        )
+        fixed += db_fixed
+        rollout_headers_fixed += db_rollouts_fixed
+
+    index_entries_refreshed = refresh_session_index(codex_home, active_threads, options)
+    large_rollouts_sanitized = sanitize_large_rollouts(
+        active_threads,
+        backup_dir,
+        options,
+    )
+
+    if options.dry_run:
+        print(f"total_would_fix={fixed}")
+        print(f"total_would_refresh_session_index_entries={index_entries_refreshed}")
+        print(f"total_would_sanitize_large_rollouts={large_rollouts_sanitized}")
+        return fixed
+
+    print(f"total_fixed={fixed}")
+    print(f"total_rollout_headers_fixed={rollout_headers_fixed}")
+    print(f"total_session_index_entries_refreshed={index_entries_refreshed}")
+    print(f"total_large_rollouts_sanitized={large_rollouts_sanitized}")
     print(f"backup={backup_dir}")
     return fixed
 
@@ -352,6 +742,41 @@ def run_self_test() -> None:
             encoding="utf-8",
         )
 
+        large_rollout = sessions / "rollout-large.jsonl"
+        large_rollout.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "timestamp": "2026-01-01T00:00:00Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "thread-large",
+                                "cwd": str(Path(tmp) / "project"),
+                                "source": "vscode",
+                                "thread_source": "user",
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        {
+                            "timestamp": "2026-01-01T00:00:01Z",
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "x" * 5000}],
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         conn = sqlite3.connect(codex_home / "state_5.sqlite")
         conn.execute(
             """
@@ -388,15 +813,43 @@ def run_self_test() -> None:
             "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?)",
             ("thread-archived", "", "", "", str(archived_rollout), "vscode", None, 1),
         )
+        conn.execute(
+            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thread-large",
+                "Large rollout",
+                "Large preview",
+                "Large first message",
+                str(large_rollout),
+                "vscode",
+                "user",
+                0,
+            ),
+        )
         conn.commit()
         conn.close()
         (codex_home / "session_index.jsonl").write_text("", encoding="utf-8")
 
-        dry_count = repair(codex_home, dry_run=True)
+        dry_options = RepairOptions(
+            dry_run=True,
+            large_rollout_bytes=1000,
+            large_string_chars=100,
+            skip_large_rollout_sanitize=False,
+            skip_session_index_refresh=False,
+        )
+        repair_options = RepairOptions(
+            dry_run=False,
+            large_rollout_bytes=1000,
+            large_string_chars=100,
+            skip_large_rollout_sanitize=False,
+            skip_session_index_refresh=False,
+        )
+
+        dry_count = repair(codex_home, dry_options)
         if dry_count != 1:
             raise AssertionError(f"dry run should find 1 thread, found {dry_count}")
 
-        fixed_count = repair(codex_home, dry_run=False)
+        fixed_count = repair(codex_home, repair_options)
         if fixed_count != 1:
             raise AssertionError(f"repair should fix 1 thread, fixed {fixed_count}")
 
@@ -435,6 +888,12 @@ def run_self_test() -> None:
         if "Build Android app" not in index:
             raise AssertionError("session_index.jsonl was not updated")
 
+        large_text = large_rollout.read_text(encoding="utf-8")
+        if "x" * 5000 in large_text:
+            raise AssertionError("large rollout string was not sanitized")
+        if "omitted large string by codex-chat-metadata-repair" not in large_text:
+            raise AssertionError("large rollout placeholder is missing")
+
         print("self_test=passed")
 
 
@@ -452,6 +911,34 @@ def main() -> int:
         "--dry-run", action="store_true", help="Report what would be changed."
     )
     parser.add_argument(
+        "--large-rollout-bytes",
+        type=int,
+        default=DEFAULT_LARGE_ROLLOUT_BYTES,
+        help=(
+            "Sanitize active rollout JSONL files at or above this size. "
+            f"Default: {DEFAULT_LARGE_ROLLOUT_BYTES}."
+        ),
+    )
+    parser.add_argument(
+        "--large-string-chars",
+        type=int,
+        default=DEFAULT_LARGE_STRING_CHARS,
+        help=(
+            "Replace strings longer than this inside large rollouts. "
+            f"Default: {DEFAULT_LARGE_STRING_CHARS}."
+        ),
+    )
+    parser.add_argument(
+        "--skip-large-rollout-sanitize",
+        action="store_true",
+        help="Do not sanitize unusually large active rollout JSONL files.",
+    )
+    parser.add_argument(
+        "--skip-session-index-refresh",
+        action="store_true",
+        help="Do not refresh existing session_index.jsonl title entries.",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run a portable synthetic repair test and exit.",
@@ -462,7 +949,14 @@ def main() -> int:
         if args.self_test:
             run_self_test()
         else:
-            repair(args.codex_home.expanduser(), args.dry_run)
+            options = RepairOptions(
+                dry_run=args.dry_run,
+                large_rollout_bytes=args.large_rollout_bytes,
+                large_string_chars=args.large_string_chars,
+                skip_large_rollout_sanitize=args.skip_large_rollout_sanitize,
+                skip_session_index_refresh=args.skip_session_index_refresh,
+            )
+            repair(args.codex_home.expanduser(), options)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
