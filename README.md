@@ -12,9 +12,10 @@ The script targets this failure mode:
 - an active rollout JSONL file is unusually large because it contains embedded
   base64 screenshots or other huge strings, causing Codex to skip or fail to
   read the thread until the app is restarted
-- an active rollout contains an invalid `image_url` value, including a previous
-  placeholder written by an older version of this script, causing API errors
-  such as `Invalid 'input[n].content[m].image_url'`
+- an active rollout contains an invalid `image_url` value, such as a local file
+  path, a malformed value, or a previous placeholder written by an older version
+  of this script, causing API errors such as
+  `Invalid 'input[n].content[m].image_url'`
 
 It creates backups before modifying anything.
 
@@ -178,11 +179,12 @@ For each active non-archived thread with missing display metadata, the script:
 11. Sanitizes unusually large active rollout JSONL files by replacing strings
     longer than 20,000 characters with placeholder text.
 12. Rewrites invalid or oversized image blocks to text placeholders, including
-    already-broken placeholder `image_url` values from older script versions.
+    local file paths, malformed `image_url` values, and already-broken
+    placeholder `image_url` values from older script versions.
 
 By default, rollout sanitization only runs for active rollout files at or above
-50 MB, or for active rollout files that contain broken placeholder image URL
-values written by older script versions. You can tune or disable this:
+50 MB, or for active rollout files that contain image URL records that would be
+invalid when sent back to the API. You can tune or disable this:
 
 ```bash
 python3 repair_codex_chat_metadata.py --large-rollout-bytes 104857600

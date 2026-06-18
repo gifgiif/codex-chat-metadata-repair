@@ -337,6 +337,18 @@ def image_url_needs_replacement(value: object, max_chars: int) -> bool:
     )
 
 
+def image_url_is_invalid(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    if value.startswith("[omitted large string by codex-chat-metadata-repair:"):
+        return True
+    return not (
+        value.startswith("https://")
+        or value.startswith("http://")
+        or value.startswith("data:image/")
+    )
+
+
 def sanitize_rollout_value(value: object, max_chars: int) -> tuple[object, int]:
     if isinstance(value, dict):
         image_url = value.get("image_url")
@@ -374,19 +386,49 @@ def sanitize_rollout_value(value: object, max_chars: int) -> tuple[object, int]:
     return shrink_large_strings(value, max_chars)
 
 
-def rollout_needs_sanitize(rollout_path: Path, min_bytes: int) -> bool:
+def value_has_invalid_image_url(value: object) -> bool:
+    if isinstance(value, dict):
+        if "image_url" in value and image_url_is_invalid(value.get("image_url")):
+            return True
+        return any(value_has_invalid_image_url(item) for item in value.values())
+
+    if isinstance(value, list):
+        return any(value_has_invalid_image_url(item) for item in value)
+
+    return False
+
+
+def rollout_needs_sanitize(
+    rollout_path: Path,
+    min_bytes: int,
+) -> bool:
     try:
         if not rollout_path.exists():
             return False
         if rollout_path.stat().st_size >= min_bytes:
             return True
-        with rollout_path.open("rb") as file:
+
+        has_image_url = False
+        with rollout_path.open("rb") as source:
             previous = b""
-            while chunk := file.read(1024 * 1024):
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 window = previous + chunk
                 if BROKEN_IMAGE_URL_PLACEHOLDER in window:
                     return True
+                if b'"image_url"' in window:
+                    has_image_url = True
                 previous = window[-len(BROKEN_IMAGE_URL_PLACEHOLDER) :]
+        if not has_image_url:
+            return False
+
+        with rollout_path.open("rb") as source:
+            for raw in source:
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if value_has_invalid_image_url(obj):
+                    return True
         return False
     except OSError:
         return False
@@ -496,7 +538,10 @@ def sanitize_large_rollouts(
 
     fixed = 0
     for thread in active_threads.values():
-        if not rollout_needs_sanitize(thread.rollout_path, options.large_rollout_bytes):
+        if not rollout_needs_sanitize(
+            thread.rollout_path,
+            options.large_rollout_bytes,
+        ):
             continue
         changed, changed_records, changed_strings, saved_bytes = sanitize_large_rollout(
             thread.rollout_path,
@@ -884,6 +929,30 @@ def run_self_test() -> None:
             encoding="utf-8",
         )
 
+        invalid_image_url_rollout = sessions / "rollout-invalid-image-url.jsonl"
+        invalid_image_url_rollout.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": "/tmp/local-screenshot.png",
+                                "detail": "high",
+                            }
+                        ],
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         conn = sqlite3.connect(codex_home / "state_5.sqlite")
         conn.execute(
             """
@@ -941,6 +1010,19 @@ def run_self_test() -> None:
                 "Bad image preview",
                 "Bad image first message",
                 str(bad_image_rollout),
+                "vscode",
+                "user",
+                0,
+            ),
+        )
+        conn.execute(
+            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thread-invalid-image-url",
+                "Invalid image URL rollout",
+                "Invalid image URL preview",
+                "Invalid image URL first message",
+                str(invalid_image_url_rollout),
                 "vscode",
                 "user",
                 0,
@@ -1023,6 +1105,12 @@ def run_self_test() -> None:
             raise AssertionError("bad image rollout image_url was not removed")
         if "omitted image by codex-chat-metadata-repair" not in bad_image_text:
             raise AssertionError("bad image rollout placeholder is missing")
+
+        invalid_image_url_text = invalid_image_url_rollout.read_text(encoding="utf-8")
+        if '"image_url"' in invalid_image_url_text:
+            raise AssertionError("invalid image URL rollout image_url was not removed")
+        if "omitted image by codex-chat-metadata-repair" not in invalid_image_url_text:
+            raise AssertionError("invalid image URL placeholder is missing")
 
         print("self_test=passed")
 
