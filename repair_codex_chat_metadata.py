@@ -31,6 +31,7 @@ from pathlib import Path
 
 DEFAULT_LARGE_ROLLOUT_BYTES = 50 * 1024 * 1024
 DEFAULT_LARGE_STRING_CHARS = 20_000
+BROKEN_IMAGE_URL_PLACEHOLDER = b'"image_url":"[omitted large string by codex-chat-metadata-repair:'
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class RepairOptions:
     large_string_chars: int
     skip_large_rollout_sanitize: bool
     skip_session_index_refresh: bool
+    thread_ids: tuple[str, ...]
 
 
 def default_codex_home() -> Path:
@@ -321,9 +323,71 @@ def shrink_large_strings(value: object, max_chars: int) -> tuple[object, int]:
     return value, 0
 
 
+def image_url_needs_replacement(value: object, max_chars: int) -> bool:
+    if not isinstance(value, str):
+        return True
+    if len(value) > max_chars:
+        return True
+    if value.startswith("[omitted large string by codex-chat-metadata-repair:"):
+        return True
+    return not (
+        value.startswith("https://")
+        or value.startswith("http://")
+        or value.startswith("data:image/")
+    )
+
+
+def sanitize_rollout_value(value: object, max_chars: int) -> tuple[object, int]:
+    if isinstance(value, dict):
+        image_url = value.get("image_url")
+        if "image_url" in value and image_url_needs_replacement(image_url, max_chars):
+            image_url_len = len(image_url) if isinstance(image_url, str) else 0
+            image_type = value.get("type") or "image"
+            return (
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[omitted image by codex-chat-metadata-repair: "
+                        f"type={image_type} image_url_chars={image_url_len}]"
+                    ),
+                },
+                1,
+            )
+
+        changed = 0
+        sanitized_dict = {}
+        for key, item in value.items():
+            sanitized, item_changed = sanitize_rollout_value(item, max_chars)
+            changed += item_changed
+            sanitized_dict[key] = sanitized
+        return sanitized_dict, changed
+
+    if isinstance(value, list):
+        changed = 0
+        sanitized_items = []
+        for item in value:
+            sanitized, item_changed = sanitize_rollout_value(item, max_chars)
+            changed += item_changed
+            sanitized_items.append(sanitized)
+        return sanitized_items, changed
+
+    return shrink_large_strings(value, max_chars)
+
+
 def rollout_needs_sanitize(rollout_path: Path, min_bytes: int) -> bool:
     try:
-        return rollout_path.exists() and rollout_path.stat().st_size >= min_bytes
+        if not rollout_path.exists():
+            return False
+        if rollout_path.stat().st_size >= min_bytes:
+            return True
+        with rollout_path.open("rb") as file:
+            previous = b""
+            while chunk := file.read(1024 * 1024):
+                window = previous + chunk
+                if BROKEN_IMAGE_URL_PLACEHOLDER in window:
+                    return True
+                previous = window[-len(BROKEN_IMAGE_URL_PLACEHOLDER) :]
+        return False
     except OSError:
         return False
 
@@ -354,7 +418,7 @@ def sanitize_large_rollout(
                 except json.JSONDecodeError:
                     new_bytes += len(raw)
                     continue
-                shrunk, line_changed_strings = shrink_large_strings(
+                shrunk, line_changed_strings = sanitize_rollout_value(
                     obj,
                     max_string_chars,
                 )
@@ -391,7 +455,7 @@ def sanitize_large_rollout(
                         new_bytes += len(text.encode("utf-8"))
                         continue
 
-                    shrunk, line_changed_strings = shrink_large_strings(
+                    shrunk, line_changed_strings = sanitize_rollout_value(
                         obj,
                         max_string_chars,
                     )
@@ -566,6 +630,9 @@ def repair_one_db(
     fixed = 0
     rollout_headers_fixed = 0
     for row in rows:
+        if options.thread_ids and row["id"] not in options.thread_ids:
+            continue
+
         rollout_path = Path(row["rollout_path"])
         text = first_user_text(rollout_path, codex_home)
         fallback = known.get(row["id"])
@@ -642,6 +709,12 @@ def repair(codex_home: Path, options: RepairOptions) -> int:
 
     known = load_known_metadata(db_paths)
     active_threads = load_active_threads(db_paths)
+    if options.thread_ids:
+        active_threads = {
+            thread_id: thread
+            for thread_id, thread in active_threads.items()
+            if thread_id in options.thread_ids
+        }
 
     fixed = 0
     rollout_headers_fixed = 0
@@ -766,12 +839,46 @@ def run_self_test() -> None:
                             "payload": {
                                 "type": "message",
                                 "role": "user",
-                                "content": [{"type": "input_text", "text": "x" * 5000}],
+                                "content": [
+                                    {
+                                        "type": "input_image",
+                                        "image_url": "data:image/png;base64,"
+                                        + ("x" * 5000),
+                                        "detail": "high",
+                                    }
+                                ],
                             },
                         },
                         separators=(",", ":"),
                     ),
                 ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bad_image_rollout = sessions / "rollout-bad-image.jsonl"
+        bad_image_rollout.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": (
+                                    "[omitted large string by "
+                                    "codex-chat-metadata-repair: 5000 chars]"
+                                ),
+                                "detail": "high",
+                            }
+                        ],
+                    },
+                },
+                separators=(",", ":"),
             )
             + "\n",
             encoding="utf-8",
@@ -826,6 +933,19 @@ def run_self_test() -> None:
                 0,
             ),
         )
+        conn.execute(
+            "insert into threads values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thread-bad-image",
+                "Bad image rollout",
+                "Bad image preview",
+                "Bad image first message",
+                str(bad_image_rollout),
+                "vscode",
+                "user",
+                0,
+            ),
+        )
         conn.commit()
         conn.close()
         (codex_home / "session_index.jsonl").write_text("", encoding="utf-8")
@@ -836,6 +956,7 @@ def run_self_test() -> None:
             large_string_chars=100,
             skip_large_rollout_sanitize=False,
             skip_session_index_refresh=False,
+            thread_ids=(),
         )
         repair_options = RepairOptions(
             dry_run=False,
@@ -843,6 +964,7 @@ def run_self_test() -> None:
             large_string_chars=100,
             skip_large_rollout_sanitize=False,
             skip_session_index_refresh=False,
+            thread_ids=(),
         )
 
         dry_count = repair(codex_home, dry_options)
@@ -890,9 +1012,17 @@ def run_self_test() -> None:
 
         large_text = large_rollout.read_text(encoding="utf-8")
         if "x" * 5000 in large_text:
-            raise AssertionError("large rollout string was not sanitized")
-        if "omitted large string by codex-chat-metadata-repair" not in large_text:
-            raise AssertionError("large rollout placeholder is missing")
+            raise AssertionError("large rollout image data was not sanitized")
+        if '"image_url"' in large_text:
+            raise AssertionError("large rollout should not keep an invalid image_url")
+        if "omitted image by codex-chat-metadata-repair" not in large_text:
+            raise AssertionError("large rollout image placeholder is missing")
+
+        bad_image_text = bad_image_rollout.read_text(encoding="utf-8")
+        if '"image_url"' in bad_image_text:
+            raise AssertionError("bad image rollout image_url was not removed")
+        if "omitted image by codex-chat-metadata-repair" not in bad_image_text:
+            raise AssertionError("bad image rollout placeholder is missing")
 
         print("self_test=passed")
 
@@ -939,6 +1069,15 @@ def main() -> int:
         help="Do not refresh existing session_index.jsonl title entries.",
     )
     parser.add_argument(
+        "--thread-id",
+        action="append",
+        default=[],
+        help=(
+            "Limit repairs to one active thread id. "
+            "May be passed more than once."
+        ),
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Run a portable synthetic repair test and exit.",
@@ -955,6 +1094,7 @@ def main() -> int:
                 large_string_chars=args.large_string_chars,
                 skip_large_rollout_sanitize=args.skip_large_rollout_sanitize,
                 skip_session_index_refresh=args.skip_session_index_refresh,
+                thread_ids=tuple(args.thread_id),
             )
             repair(args.codex_home.expanduser(), options)
     except Exception as exc:
