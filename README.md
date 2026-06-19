@@ -18,6 +18,7 @@ The script targets this failure mode:
   `Invalid 'input[n].content[m].image_url'`
 
 It creates backups before modifying anything.
+When no changes are needed, no backup directory is created.
 
 Recent Codex Desktop builds may use either of these local SQLite layouts:
 
@@ -120,6 +121,24 @@ After it finishes, open Codex again.
 If Codex was already running, fully quit and reopen it. Codex can keep a stale
 thread index in memory, so repairs may not appear until restart.
 
+## macOS Auto-Repair
+
+If Codex updates keep breaking local chat metadata, you can install a LaunchAgent
+that runs the repair script at login and then periodically.
+
+```bash
+python3 repair_codex_chat_metadata.py --install-macos-launch-agent
+```
+
+By default it runs every 5 minutes. To use a different interval:
+
+```bash
+python3 repair_codex_chat_metadata.py --install-macos-launch-agent --launch-agent-interval 600
+```
+
+The LaunchAgent uses the absolute path of the script you installed from, so keep
+the cloned repository in place. Logs are written under `~/Library/Logs/`.
+
 ## Custom Codex Home
 
 By default the script uses:
@@ -150,7 +169,7 @@ Before a real repair, the script creates a backup directory:
 ~/.codex/recovery_backups/quick_chat_metadata_fix_YYYYMMDDTHHMMSSZ/
 ```
 
-It backs up:
+When a real repair changes files, it backs up:
 
 - `state_5.sqlite`
 - `state_5.sqlite-wal`
@@ -230,6 +249,12 @@ total_large_rollouts_sanitized=0
 total_fixed=1
 total_rollout_headers_fixed=1
 backup=/Users/example/.codex/recovery_backups/quick_chat_metadata_fix_20260611T103851Z
+```
+
+If nothing needed to be changed, repair output includes:
+
+```text
+backup=not_created_no_changes
 ```
 
 ## Troubleshooting

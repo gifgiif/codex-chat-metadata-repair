@@ -18,9 +18,11 @@ Close Codex before running it.
 import argparse
 import json
 import os
+import plistlib
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ from pathlib import Path
 DEFAULT_LARGE_ROLLOUT_BYTES = 50 * 1024 * 1024
 DEFAULT_LARGE_STRING_CHARS = 20_000
 BROKEN_IMAGE_URL_PLACEHOLDER = b'"image_url":"[omitted large string by codex-chat-metadata-repair:'
+LAUNCH_AGENT_LABEL = "com.codex-chat-metadata-repair"
 
 
 @dataclass(frozen=True)
@@ -187,7 +190,7 @@ def state_db_paths(codex_home: Path) -> list[Path]:
 
 
 def backup_files(codex_home: Path, db_paths: list[Path], backup_dir: Path) -> None:
-    backup_dir.mkdir(parents=True, exist_ok=False)
+    backup_dir.mkdir(parents=True, exist_ok=True)
     for db_path in db_paths:
         relative = db_path.relative_to(codex_home)
         for source in (
@@ -222,9 +225,29 @@ def backup_rollout(rollout_path: Path, backup_dir: Path, thread_id: str) -> None
         shutil.copy2(rollout_path, rollout_backup)
 
 
+class BackupManager:
+    def __init__(self, codex_home: Path, db_paths: list[Path], backup_dir: Path):
+        self.codex_home = codex_home
+        self.db_paths = db_paths
+        self.backup_dir = backup_dir
+        self._state_files_backed_up = False
+
+    def backup_state_files(self) -> None:
+        if self._state_files_backed_up:
+            return
+        backup_files(self.codex_home, self.db_paths, self.backup_dir)
+        self._state_files_backed_up = True
+
+    def backup_rollout(self, rollout_path: Path, thread_id: str) -> None:
+        backup_rollout(rollout_path, self.backup_dir, thread_id)
+
+    def created_backup(self) -> bool:
+        return self.backup_dir.exists()
+
+
 def repair_rollout_header(
     rollout_path: Path,
-    backup_dir: Path,
+    backups: BackupManager,
     thread_id: str,
     dry_run: bool,
 ) -> bool:
@@ -251,7 +274,7 @@ def repair_rollout_header(
         return False
 
     if not dry_run:
-        backup_rollout(rollout_path, backup_dir, thread_id)
+        backups.backup_rollout(rollout_path, thread_id)
         payload["thread_source"] = "user"
         lines[0] = (
             json.dumps(first_obj, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -436,7 +459,7 @@ def rollout_needs_sanitize(
 
 def sanitize_large_rollout(
     rollout_path: Path,
-    backup_dir: Path,
+    backups: BackupManager,
     thread_id: str,
     max_string_chars: int,
     dry_run: bool,
@@ -516,7 +539,7 @@ def sanitize_large_rollout(
                 with tmp_path.open(encoding="utf-8") as validate:
                     for line in validate:
                         json.loads(line)
-                backup_rollout(rollout_path, backup_dir, thread_id)
+                backups.backup_rollout(rollout_path, thread_id)
                 shutil.copystat(rollout_path, tmp_path)
                 tmp_path.replace(rollout_path)
             else:
@@ -530,7 +553,7 @@ def sanitize_large_rollout(
 
 def sanitize_large_rollouts(
     active_threads: dict[str, ActiveThread],
-    backup_dir: Path,
+    backups: BackupManager,
     options: RepairOptions,
 ) -> int:
     if options.skip_large_rollout_sanitize:
@@ -545,7 +568,7 @@ def sanitize_large_rollouts(
             continue
         changed, changed_records, changed_strings, saved_bytes = sanitize_large_rollout(
             thread.rollout_path,
-            backup_dir,
+            backups,
             thread.thread_id,
             options.large_string_chars,
             options.dry_run,
@@ -565,6 +588,7 @@ def sanitize_large_rollouts(
 def refresh_session_index(
     codex_home: Path,
     active_threads: dict[str, ActiveThread],
+    backups: BackupManager,
     options: RepairOptions,
 ) -> int:
     if options.skip_session_index_refresh:
@@ -599,6 +623,7 @@ def refresh_session_index(
         refreshed.append(line)
 
     if changed and not options.dry_run:
+        backups.backup_state_files()
         index_path.write_text("".join(refreshed), encoding="utf-8")
 
     if changed:
@@ -648,7 +673,7 @@ def load_known_metadata(db_paths: list[Path]) -> dict[str, KnownMetadata]:
 def repair_one_db(
     codex_home: Path,
     db_path: Path,
-    backup_dir: Path,
+    backups: BackupManager,
     known: dict[str, KnownMetadata],
     options: RepairOptions,
 ) -> tuple[int, int]:
@@ -708,6 +733,7 @@ def repair_one_db(
         )
 
         if not options.dry_run:
+            backups.backup_state_files()
             conn.execute(
                 """
                 update threads
@@ -720,7 +746,7 @@ def repair_one_db(
 
         if row["source"] == "vscode" and repair_rollout_header(
             rollout_path,
-            backup_dir,
+            backups,
             row["id"],
             options.dry_run,
         ):
@@ -749,8 +775,7 @@ def repair(codex_home: Path, options: RepairOptions) -> int:
     backup_dir = (
         codex_home / "recovery_backups" / f"quick_chat_metadata_fix_{utc_stamp()}"
     )
-    if not options.dry_run:
-        backup_files(codex_home, db_paths, backup_dir)
+    backups = BackupManager(codex_home, db_paths, backup_dir)
 
     known = load_known_metadata(db_paths)
     active_threads = load_active_threads(db_paths)
@@ -765,15 +790,20 @@ def repair(codex_home: Path, options: RepairOptions) -> int:
     rollout_headers_fixed = 0
     for db_path in db_paths:
         db_fixed, db_rollouts_fixed = repair_one_db(
-            codex_home, db_path, backup_dir, known, options
+            codex_home, db_path, backups, known, options
         )
         fixed += db_fixed
         rollout_headers_fixed += db_rollouts_fixed
 
-    index_entries_refreshed = refresh_session_index(codex_home, active_threads, options)
+    index_entries_refreshed = refresh_session_index(
+        codex_home,
+        active_threads,
+        backups,
+        options,
+    )
     large_rollouts_sanitized = sanitize_large_rollouts(
         active_threads,
-        backup_dir,
+        backups,
         options,
     )
 
@@ -787,7 +817,10 @@ def repair(codex_home: Path, options: RepairOptions) -> int:
     print(f"total_rollout_headers_fixed={rollout_headers_fixed}")
     print(f"total_session_index_entries_refreshed={index_entries_refreshed}")
     print(f"total_large_rollouts_sanitized={large_rollouts_sanitized}")
-    print(f"backup={backup_dir}")
+    if backups.created_backup():
+        print(f"backup={backup_dir}")
+    else:
+        print("backup=not_created_no_changes")
     return fixed
 
 
@@ -1115,6 +1148,70 @@ def run_self_test() -> None:
         print("self_test=passed")
 
 
+def install_macos_launch_agent(
+    script_path: Path,
+    codex_home: Path,
+    interval_seconds: int,
+) -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("--install-macos-launch-agent is only supported on macOS")
+    if interval_seconds < 60:
+        raise ValueError("--launch-agent-interval must be at least 60 seconds")
+
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    logs_dir = Path.home() / "Library" / "Logs"
+    plist_path = launch_agents_dir / f"{LAUNCH_AGENT_LABEL}.plist"
+    script_path = script_path.resolve()
+    codex_home = codex_home.expanduser().resolve()
+
+    launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    plist = {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [
+            sys.executable or "/usr/bin/python3",
+            str(script_path),
+            "--codex-home",
+            str(codex_home),
+        ],
+        "RunAtLoad": True,
+        "StartInterval": interval_seconds,
+        "StandardOutPath": str(logs_dir / f"{LAUNCH_AGENT_LABEL}.log"),
+        "StandardErrorPath": str(logs_dir / f"{LAUNCH_AGENT_LABEL}.err.log"),
+    }
+
+    with plist_path.open("wb") as file:
+        plistlib.dump(plist, file)
+
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(
+        ["launchctl", "bootout", domain, str(plist_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    bootstrap = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(plist_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if bootstrap.returncode != 0:
+        message = bootstrap.stderr.strip() or bootstrap.stdout.strip()
+        raise RuntimeError(f"launchctl bootstrap failed: {message}")
+
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", f"{domain}/{LAUNCH_AGENT_LABEL}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    print(f"launch_agent_installed={plist_path}")
+    print(f"launch_agent_interval_seconds={interval_seconds}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Repair active Codex chat display metadata."
@@ -1170,11 +1267,28 @@ def main() -> int:
         action="store_true",
         help="Run a portable synthetic repair test and exit.",
     )
+    parser.add_argument(
+        "--install-macos-launch-agent",
+        action="store_true",
+        help="Install a macOS LaunchAgent that runs this repair script periodically.",
+    )
+    parser.add_argument(
+        "--launch-agent-interval",
+        type=int,
+        default=300,
+        help="LaunchAgent repair interval in seconds. Default: 300.",
+    )
     args = parser.parse_args()
 
     try:
         if args.self_test:
             run_self_test()
+        elif args.install_macos_launch_agent:
+            install_macos_launch_agent(
+                Path(__file__),
+                args.codex_home,
+                args.launch_agent_interval,
+            )
         else:
             options = RepairOptions(
                 dry_run=args.dry_run,
