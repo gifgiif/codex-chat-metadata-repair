@@ -1155,7 +1155,7 @@ def install_macos_launch_agent(
 ) -> None:
     if sys.platform != "darwin":
         raise RuntimeError("--install-macos-launch-agent is only supported on macOS")
-    if interval_seconds < 60:
+    if interval_seconds and interval_seconds < 60:
         raise ValueError("--launch-agent-interval must be at least 60 seconds")
 
     launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
@@ -1167,6 +1167,14 @@ def install_macos_launch_agent(
     launch_agents_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    watch_paths = [
+        codex_home / "state_5.sqlite",
+        codex_home / "state_5.sqlite-wal",
+        codex_home / "sqlite" / "state_5.sqlite",
+        codex_home / "sqlite" / "state_5.sqlite-wal",
+        codex_home / "session_index.jsonl",
+    ]
+
     plist = {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": [
@@ -1176,10 +1184,12 @@ def install_macos_launch_agent(
             str(codex_home),
         ],
         "RunAtLoad": True,
-        "StartInterval": interval_seconds,
+        "WatchPaths": [str(path) for path in watch_paths],
         "StandardOutPath": str(logs_dir / f"{LAUNCH_AGENT_LABEL}.log"),
         "StandardErrorPath": str(logs_dir / f"{LAUNCH_AGENT_LABEL}.err.log"),
     }
+    if interval_seconds:
+        plist["StartInterval"] = interval_seconds
 
     with plist_path.open("wb") as file:
         plistlib.dump(plist, file)
@@ -1209,7 +1219,10 @@ def install_macos_launch_agent(
     )
 
     print(f"launch_agent_installed={plist_path}")
-    print(f"launch_agent_interval_seconds={interval_seconds}")
+    launch_agent_mode = "watch_paths_and_interval" if interval_seconds else "watch_paths"
+    print(f"launch_agent_mode={launch_agent_mode}")
+    if interval_seconds:
+        print(f"launch_agent_interval_seconds={interval_seconds}")
 
 
 def main() -> int:
@@ -1270,13 +1283,19 @@ def main() -> int:
     parser.add_argument(
         "--install-macos-launch-agent",
         action="store_true",
-        help="Install a macOS LaunchAgent that runs this repair script periodically.",
+        help=(
+            "Install a macOS LaunchAgent that runs this repair script "
+            "when Codex state changes."
+        ),
     )
     parser.add_argument(
         "--launch-agent-interval",
         type=int,
-        default=300,
-        help="LaunchAgent repair interval in seconds. Default: 300.",
+        default=0,
+        help=(
+            "Optional periodic LaunchAgent repair interval in seconds. "
+            "Default: 0, disabled."
+        ),
     )
     args = parser.parse_args()
 

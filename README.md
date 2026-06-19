@@ -124,20 +124,22 @@ thread index in memory, so repairs may not appear until restart.
 ## macOS Auto-Repair
 
 If Codex updates keep breaking local chat metadata, you can install a LaunchAgent
-that runs the repair script at login and then periodically.
+that runs the repair script at login and when Codex local state files change.
+This avoids polling every few minutes.
 
 ```bash
 python3 repair_codex_chat_metadata.py --install-macos-launch-agent
 ```
 
-By default it runs every 5 minutes. To use a different interval:
+If you still want a periodic fallback, pass an interval explicitly:
 
 ```bash
 python3 repair_codex_chat_metadata.py --install-macos-launch-agent --launch-agent-interval 600
 ```
 
 The LaunchAgent uses the absolute path of the script you installed from, so keep
-the cloned repository in place. Logs are written under `~/Library/Logs/`.
+the cloned repository in place. It watches Codex SQLite/index files under
+`~/.codex` and writes logs under `~/Library/Logs/`.
 
 ## Custom Codex Home
 
