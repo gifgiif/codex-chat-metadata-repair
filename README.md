@@ -121,11 +121,17 @@ After it finishes, open Codex again.
 If Codex was already running, fully quit and reopen it. Codex can keep a stale
 thread index in memory, so repairs may not appear until restart.
 
+For safety, a full repair refuses to run while Codex is open. Full repair can
+rewrite rollout files; replacing one while Codex still has it open can make new
+messages disappear after the next restart. `--metadata-only` is the only write
+mode intended to run alongside Codex.
+
 ## macOS Auto-Repair
 
-If Codex updates keep breaking local chat metadata, you can install a LaunchAgent
-that runs the repair script at login and when Codex local state files change.
-This avoids polling every few minutes.
+If Codex updates keep breaking local chat metadata, you can install a LaunchAgent.
+It starts when Codex state changes, waits for Codex to quit, and then performs a
+SQLite-only metadata repair. It does not poll and never rewrites rollout JSONL
+or `session_index.jsonl` files while Codex is running.
 
 ```bash
 python3 repair_codex_chat_metadata.py --install-macos-launch-agent
@@ -139,7 +145,12 @@ python3 repair_codex_chat_metadata.py --install-macos-launch-agent --launch-agen
 
 The LaunchAgent uses the absolute path of the script you installed from, so keep
 the cloned repository in place. It watches Codex SQLite/index files under
-`~/.codex` and writes logs under `~/Library/Logs/`.
+`~/.codex`, stays idle until Codex exits, and writes logs under
+`~/Library/Logs/`.
+
+The automatic mode intentionally repairs SQLite metadata only. Run the script
+manually with Codex fully closed when rollout sanitization or
+`session_index.jsonl` repair is needed.
 
 ## Custom Codex Home
 

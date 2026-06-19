@@ -20,11 +20,13 @@ import json
 import os
 import plistlib
 import re
+import select
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
@@ -44,6 +46,7 @@ class RepairOptions:
     large_string_chars: int
     skip_large_rollout_sanitize: bool
     skip_session_index_refresh: bool
+    metadata_only: bool
     thread_ids: tuple[str, ...]
 
 
@@ -254,6 +257,7 @@ def repair_rollout_header(
     if not rollout_path.exists():
         return False
     try:
+        original_stat = rollout_path.stat()
         lines = rollout_path.read_text(encoding="utf-8", errors="replace").splitlines(
             keepends=True
         )
@@ -279,6 +283,14 @@ def repair_rollout_header(
         lines[0] = (
             json.dumps(first_obj, ensure_ascii=False, separators=(",", ":")) + "\n"
         )
+        current_stat = rollout_path.stat()
+        if (
+            current_stat.st_ino != original_stat.st_ino
+            or current_stat.st_size != original_stat.st_size
+            or current_stat.st_mtime_ns != original_stat.st_mtime_ns
+        ):
+            print(f"skipped changed rollout header {thread_id}")
+            return False
         rollout_path.write_text("".join(lines), encoding="utf-8")
     return True
 
@@ -470,6 +482,7 @@ def sanitize_large_rollout(
     new_bytes = 0
 
     try:
+        original_stat = rollout_path.stat()
         source = rollout_path.open("rb")
     except OSError:
         return False, 0, 0, 0
@@ -540,6 +553,15 @@ def sanitize_large_rollout(
                     for line in validate:
                         json.loads(line)
                 backups.backup_rollout(rollout_path, thread_id)
+                current_stat = rollout_path.stat()
+                if (
+                    current_stat.st_ino != original_stat.st_ino
+                    or current_stat.st_size != original_stat.st_size
+                    or current_stat.st_mtime_ns != original_stat.st_mtime_ns
+                ):
+                    print(f"skipped changed rollout {thread_id}")
+                    tmp_path.unlink(missing_ok=True)
+                    return False, 0, 0, 0
                 shutil.copystat(rollout_path, tmp_path)
                 tmp_path.replace(rollout_path)
             else:
@@ -742,13 +764,18 @@ def repair_one_db(
                 """,
                 (title, preview, first_message, thread_source, row["id"]),
             )
-            append_session_index(codex_home, row["id"], title)
+            if not options.metadata_only:
+                append_session_index(codex_home, row["id"], title)
 
-        if row["source"] == "vscode" and repair_rollout_header(
-            rollout_path,
-            backups,
-            row["id"],
-            options.dry_run,
+        if (
+            not options.metadata_only
+            and row["source"] == "vscode"
+            and repair_rollout_header(
+                rollout_path,
+                backups,
+                row["id"],
+                options.dry_run,
+            )
         ):
             rollout_headers_fixed += 1
         fixed += 1
@@ -795,17 +822,20 @@ def repair(codex_home: Path, options: RepairOptions) -> int:
         fixed += db_fixed
         rollout_headers_fixed += db_rollouts_fixed
 
-    index_entries_refreshed = refresh_session_index(
-        codex_home,
-        active_threads,
-        backups,
-        options,
-    )
-    large_rollouts_sanitized = sanitize_large_rollouts(
-        active_threads,
-        backups,
-        options,
-    )
+    index_entries_refreshed = 0
+    large_rollouts_sanitized = 0
+    if not options.metadata_only:
+        index_entries_refreshed = refresh_session_index(
+            codex_home,
+            active_threads,
+            backups,
+            options,
+        )
+        large_rollouts_sanitized = sanitize_large_rollouts(
+            active_threads,
+            backups,
+            options,
+        )
 
     if options.dry_run:
         print(f"total_would_fix={fixed}")
@@ -1071,6 +1101,16 @@ def run_self_test() -> None:
             large_string_chars=100,
             skip_large_rollout_sanitize=False,
             skip_session_index_refresh=False,
+            metadata_only=False,
+            thread_ids=(),
+        )
+        metadata_only_options = RepairOptions(
+            dry_run=False,
+            large_rollout_bytes=1000,
+            large_string_chars=100,
+            skip_large_rollout_sanitize=False,
+            skip_session_index_refresh=False,
+            metadata_only=True,
             thread_ids=(),
         )
         repair_options = RepairOptions(
@@ -1079,12 +1119,36 @@ def run_self_test() -> None:
             large_string_chars=100,
             skip_large_rollout_sanitize=False,
             skip_session_index_refresh=False,
+            metadata_only=False,
             thread_ids=(),
         )
 
         dry_count = repair(codex_home, dry_options)
         if dry_count != 1:
             raise AssertionError(f"dry run should find 1 thread, found {dry_count}")
+
+        rollout_before = rollout.read_bytes()
+        index_before = (codex_home / "session_index.jsonl").read_bytes()
+        metadata_fixed_count = repair(codex_home, metadata_only_options)
+        if metadata_fixed_count != 1:
+            raise AssertionError(
+                f"metadata-only repair should fix 1 thread, fixed {metadata_fixed_count}"
+            )
+        if rollout.read_bytes() != rollout_before:
+            raise AssertionError("metadata-only repair changed a rollout")
+        if (codex_home / "session_index.jsonl").read_bytes() != index_before:
+            raise AssertionError("metadata-only repair changed the session index")
+
+        conn = sqlite3.connect(codex_home / "state_5.sqlite")
+        conn.execute(
+            """
+            update threads
+            set title = '', preview = '', first_user_message = '', thread_source = null
+            where id = 'thread-1'
+            """
+        )
+        conn.commit()
+        conn.close()
 
         fixed_count = repair(codex_home, repair_options)
         if fixed_count != 1:
@@ -1148,6 +1212,86 @@ def run_self_test() -> None:
         print("self_test=passed")
 
 
+def macos_codex_process_ids() -> set[int]:
+    result = subprocess.run(
+        ["/usr/bin/pgrep", "-x", "Codex"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode == 1:
+        return set()
+    if result.returncode != 0:
+        raise RuntimeError(f"pgrep failed: {result.stderr.strip()}")
+    return {int(value) for value in result.stdout.split()}
+
+
+def codex_is_running() -> bool:
+    if sys.platform == "darwin":
+        return bool(macos_codex_process_ids())
+
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"tasklist failed: {result.stderr.strip()}")
+        return '"Codex.exe"' in result.stdout
+
+    result = subprocess.run(
+        ["pgrep", "-x", "codex"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"pgrep failed: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def wait_for_macos_codex_exit() -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("--wait-for-codex-exit is only supported on macOS")
+
+    # Give the app process time to appear after a state-file launch event.
+    time.sleep(1)
+    process_ids = macos_codex_process_ids()
+
+    if not process_ids:
+        return
+
+    watched_process_ids: set[int] = set()
+    queue = select.kqueue()
+    try:
+        for process_id in process_ids:
+            event = select.kevent(
+                process_id,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            try:
+                queue.control([event], 0, 0)
+            except ProcessLookupError:
+                continue
+            watched_process_ids.add(process_id)
+
+        if watched_process_ids:
+            process_list = ",".join(map(str, sorted(watched_process_ids)))
+            print(f"waiting_for_codex_exit={process_list}", flush=True)
+        while watched_process_ids:
+            for event in queue.control(None, len(watched_process_ids), None):
+                watched_process_ids.discard(event.ident)
+    finally:
+        queue.close()
+
+
 def install_macos_launch_agent(
     script_path: Path,
     codex_home: Path,
@@ -1182,6 +1326,8 @@ def install_macos_launch_agent(
             str(script_path),
             "--codex-home",
             str(codex_home),
+            "--wait-for-codex-exit",
+            "--metadata-only",
         ],
         "RunAtLoad": True,
         "WatchPaths": [str(path) for path in watch_paths],
@@ -1219,7 +1365,11 @@ def install_macos_launch_agent(
     )
 
     print(f"launch_agent_installed={plist_path}")
-    launch_agent_mode = "watch_paths_and_interval" if interval_seconds else "watch_paths"
+    launch_agent_mode = (
+        "after_codex_exit_and_interval"
+        if interval_seconds
+        else "after_codex_exit"
+    )
     print(f"launch_agent_mode={launch_agent_mode}")
     if interval_seconds:
         print(f"launch_agent_interval_seconds={interval_seconds}")
@@ -1267,6 +1417,19 @@ def main() -> int:
         help="Do not refresh existing session_index.jsonl title entries.",
     )
     parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help=(
+            "Only update SQLite metadata. Do not write rollout JSONL or "
+            "session_index.jsonl files."
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-codex-exit",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--thread-id",
         action="append",
         default=[],
@@ -1309,12 +1472,20 @@ def main() -> int:
                 args.launch_agent_interval,
             )
         else:
+            if args.wait_for_codex_exit:
+                wait_for_macos_codex_exit()
+            if not args.dry_run and not args.metadata_only and codex_is_running():
+                raise RuntimeError(
+                    "Codex is running. Fully quit Codex before a full repair, "
+                    "or use --metadata-only."
+                )
             options = RepairOptions(
                 dry_run=args.dry_run,
                 large_rollout_bytes=args.large_rollout_bytes,
                 large_string_chars=args.large_string_chars,
                 skip_large_rollout_sanitize=args.skip_large_rollout_sanitize,
                 skip_session_index_refresh=args.skip_session_index_refresh,
+                metadata_only=args.metadata_only,
                 thread_ids=tuple(args.thread_id),
             )
             repair(args.codex_home.expanduser(), options)
